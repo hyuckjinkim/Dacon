@@ -1,0 +1,837 @@
+#===============================================================================================#
+# 파 일 명 : 전력사용량 예측 AI 경진대회
+# 시작날짜 : 2021.05.18
+# 수정날짜 : 
+# 작 성 자 : 김혁진
+# 작성주제 : Dacon / 7. 전력사용량 예측 AI 경진대회
+#===============================================================================================#
+# >>>>> 기본지식 ----
+# 
+# 1.
+#
+#===============================================================================================#
+# >>>>> 고려사항 ----
+# 
+# (OK)1. 보간할 때, (day,hour)에서 (num,hour)로 변경
+#     2. 선형보간할때도 train test 미리 나눠서 적용해야함
+#        -> 
+#
+#===============================================================================================#
+
+
+#======================================================================================================#
+# >>>>> 0. 기본설정 : Env 초기화, Path 지정, Package Load, pbapply opt. ----
+#======================================================================================================#
+
+# Env 초기화
+rm(list=ls())
+invisible(gc(reset=T))
+
+# Grapics Off
+graphics.off()
+
+# 작업 디렉토리 설정
+setwd('F:/USB포맷_210223/STUDY/Dacon/7. 전력사용량 예측 AI 경진대회')
+
+# seed 설정
+seed.num <- 7777777
+
+# user defined function
+source('F:/USB포맷_210223/STUDY/User Defined Function/R_function.R', encoding = 'UTF-8')
+
+# package name
+pkg <- c("plyr","dplyr","data.table","pbapply","randomForest","Metrics","sqldf","splitstackshape","ggplot2","factoextra","gridExtra","gbm","ddpcr","h2o")
+
+# require libraries
+Packages_fn(pkg)
+
+# pbapply library options
+pboptions(type = "timer", style = 3, char = "=")
+
+# rm needless obj.
+rm(pkg)
+
+
+
+# java jdk 경로잡기
+java.jdk.path <- 'C:/Program Files/Java/jdk1.8.0_291'
+Sys.setenv("JAVA_HOME"=java.jdk.path)
+Sys.setenv("PATH" = paste(Sys.getenv("PATH"), java.jdk.path, sep = ":"))
+
+# h2o 설치를 위한 의존성 패키지들 설치
+pkgs <- c("RCurl","jsonlite")
+Packages_fn(pkgs)
+
+# restart h2o cluster
+h2o.shutdown(prompt = F)
+
+# h20 connect
+local.h2o <- h2o.init(nthreads = -1, max_mem_size = "8g")
+
+# # remove all h2o obj.
+# h2o.removeAll()
+
+# h2o : no pregress bar
+h2o.no_progress()
+
+
+#======================================================================================================#
+# >>>>> 1. Data Load ----
+#======================================================================================================#
+
+train_dt <- fread('train.csv', header = T, stringsAsFactors = F, sep = ',')
+test_dt  <- fread('test.csv' , header = T, stringsAsFactors = F, sep = ',')
+
+col.nm   <- c('num','time','used.power','temperature','wind.speed','humidity','rainfall','sunlight','non.elect.cooling','is.have.solar')
+
+colnames(train_dt) <- col.nm
+colnames(test_dt)  <- col.nm[-3]
+
+# 데이터 확인
+desc_fn(test_dt)
+
+# 변수 확인
+colnames(train_dt)
+# 1. num : 건물번호
+# 2. time : 시간
+# 3. used.power : 전력사용량(kWh)
+# 4. temperature : 기온('C)
+# 5. wind.speed : 풍속(m/s)
+# 6. humidity : 습도(%)
+# 7. rainfall : 강수량(mm)
+# 8. sunlight : 일조(hr)
+# 9. non.elect.cooling : 비전기냉방설비운영
+# 10. is.have.solar : 태양광보유여부
+
+# # 간단하게 튀는값 확인
+# par(mfrow=c(3,2))
+# table(train_dt$num)
+# boxplot(train_dt$used.power ~ train_dt$num)
+# boxplot(train_dt$temperature ~ train_dt$num)
+# boxplot(train_dt$wind.speed ~ train_dt$num)
+# boxplot(train_dt$humidity ~ train_dt$num)
+# boxplot(train_dt$rainfall ~ train_dt$num)
+# boxplot(train_dt$rainfall ~ train_dt$num)
+# table(train_dt$sunlight)
+# table(train_dt$non.elect.cooling)
+# table(train_dt$is.have.solar)
+
+# rm needless obj.
+rm(col.nm)
+
+
+#======================================================================================================#
+# >>>>> 2. 파생변수 생성 ----
+#======================================================================================================#
+
+# 파생변수 생성
+new_feature_fn <- function(dt){
+  
+  # dt <- train_dt
+  
+  # 2.1. time + (year,month,day) + (hour)
+  dt[, time := as.POSIXct(paste0(time,':00:00'), format = "%Y-%m-%d %H:%M:%S")] # format datetime
+  
+  dt[, year := as.numeric(format(time, format = '%Y'))      # year
+  ][, month := as.numeric(format(time, format = '%m'))     # month
+  ][, day := as.numeric(format(time, format = '%d'))     # day
+  ][, hour := as.numeric(format(time, format = '%H'))  # hour
+  ]
+  
+  # 2.2. 보름,계절 
+  dt[, onehot.spring := ifelse(month %in% c('3','4','5'),1,0)   # spring one-hot coding
+  ][,  onehot.summer := ifelse(month %in% c('6','7','8'),1,0)   # summer one-hot coding
+  ][,  onehot.fall   := ifelse(month %in% c('9','10','11'),1,0) # fall   one-hot coding
+  ][,  onehot.winter := ifelse(month %in% c('12','1','2'),1,0)  # winter one-hot coding
+  ]
+  
+  # 2.3. Am/Pm
+  dt[, AMPM := ifelse(hour<12,'AM','PM')]      # AM : 0~11시 : 1, PM : 12시~23시
+  
+  # 2.4. 5일간격
+  dt[, day.5 := ifelse(day<=5,'1~5',
+                       ifelse(day<=10,'6~10',
+                              ifelse(day<=15,'11~15',
+                                     ifelse(day<=20,'16~20',
+                                            ifelse(day<=25,'21~25',
+                                                   ifelse(day<=31,'26~31','error'))))))]
+  
+  # 2.5. 10일 간격
+  dt[, day.10 := ifelse(day<=10,'1~10',
+                        ifelse(day<=20,'11~20',
+                               ifelse(day<=31,'21~31','error')))]
+  
+  # 2.6. 15일 간격
+  dt[, day.15 := ifelse(day<=15,'1~15','16~31')]
+  
+  # 2.7. 3시간 간격
+  dt[, hour.3 := ifelse(hour<=3,'0~3',
+                        ifelse(hour<=6,'4~6',
+                               ifelse(hour<=9,'7~9',
+                                      ifelse(hour<=12,'10~12',
+                                             ifelse(hour<=15,'13~15',
+                                                    ifelse(hour<=18,'16~18',
+                                                           ifelse(hour<=21,'19~21','22~24')))))))]
+  
+  # 2.8. 6시간 간격
+  dt[, hour.6 := ifelse(hour<=6,'0~6',
+                        ifelse(hour<=12,'7~12',
+                               ifelse(hour<=18,'13~18','19~24')))]
+  
+  # 2.9. 12시간 간격
+  dt[, hour.12 := ifelse(hour<=12,'0~12','13~24')]
+  
+  # 2.10 요일 및 주말여부
+  dt[, weekdays := as.numeric(format(time, format = '%u'))
+  ][, weekend := ifelse(weekdays %in% c(6,7),1,0)]
+  
+  # dt$time <- NULL
+  
+  dt$year          <- NULL # 전부 2020년
+  dt$month         <- NULL # 6,7,8월밖에 없음
+  dt$onehot.spring <- NULL
+  dt$onehot.summer <- NULL
+  dt$onehot.fall   <- NULL
+  dt$onehot.winter <- NULL
+  
+  return(dt)
+}
+
+train_dt2 <- new_feature_fn(train_dt)
+test_dt2  <- new_feature_fn(test_dt)
+
+# rm needless obj.
+rm(train_dt, test_dt)
+
+
+
+# # (출처) https://dacon.io/competitions/official/235736/codeshare/2643?page=1&dtype=recent
+# # 특정 건물의 요일/시간별 전력사용량
+# graphics.off()
+# for ( i in 1:5){
+#   # i <- 1
+#   p = train_dt2[num==i, .(M = median(used.power)), by=.(hour, weekdays)] %>% 
+#     ggplot(aes(hour, weekdays, fill=M)) + 
+#     geom_tile() +
+#     scale_fill_distiller(palette='YlGnBu', direction=-1) +
+#     ggtitle(paste0(i, '번째 건물'))
+#   plot(p)
+# }
+
+
+
+
+
+#======================================================================================================#
+# >>>>> 3. Validation Data 생성 ----
+#======================================================================================================#
+
+# paste0(train_dt2$num,'_',train_dt2$hour.3,'_',train_dt2$non.elect.cooling,'_',train_dt2$is.have.solar,train_dt2$weekday) %>% table
+
+# num, hour 그룹별로 tr/valid 나누기
+set.seed(seed.num)
+train_dt3 <- splitstackshape::stratified(train_dt2, group = c('num','day','hour'), size = 0.60)
+valid_dt3 <- setdiff(train_dt2, train_dt3)
+test_dt3  <- test_dt2
+
+# chk nrow
+nrow(train_dt2); nrow(train_dt3)+nrow(valid_dt3)
+
+# ratio
+nrow(train_dt3)/nrow(train_dt2)
+nrow(valid_dt3)/nrow(train_dt2)
+
+# rm needless obj.
+rm(train_dt2, test_dt2)
+
+#======================================================================================================#
+# >>>>> 4. num에 따른 전력사용량 Plot 확인 ----
+#======================================================================================================#
+# pblapply(1:60, function(num.i){
+#   
+#   # num.i <- 1
+#   
+#   graphics.off()
+#   sub <- subset(train_dt3, subset = (num==num.i))
+#   x   <- sub$time[order(sub$time)]
+#   y   <- sub$used.power[order(sub$time)]
+#   
+#   png(paste0('F:/USB포맷_210223/STUDY/Dacon/7. 전력사용량 예측 AI 경진대회/OUT/NUM',num.i,'.png'),
+#       width=480*3, height=480*2)
+#   
+#   par(mfrow=c(1,2), oma=c(0,0,2,0))
+#   
+#   plot(x,y,pch='.', type='l', xaxt='n', xlab = 'Time', ylab = 'Target')
+#   axis.POSIXct(1,
+#                at = seq(min(x), max(x), by = 'months'),
+#                labels = format(seq(min(x), max(x), by = 'months'), "%y/%m"),
+#                las=2)
+#   abline(h=median(y), col=2)
+#   
+#   boxplot(y)
+#   
+#   mtext(paste0('NUM : ', num.i), outer=T, cex=1.5)
+#   
+#   dev.off()
+# }) %>% invisible
+
+# boxplot(train_dt3$used.power ~ train_dt3$day)
+# 
+# boxplot(train_dt3$used.power ~ train_dt3$non.elect.cooling)
+# boxplot(train_dt3$used.power ~ train_dt3$is.have.solar)
+
+
+#======================================================================================================#
+# >>>>> 5. SEG 생성 ----
+#======================================================================================================#
+
+# (출처) https://dacon.io/competitions/official/235736/codeshare/2643?page=1&dtype=recent
+
+# 특정 건물의 요일/3시간별 전력사용량
+train_dt3[, hour_by3 := formatC((as.integer(format(time, format='%H')) %/% 3)*3, width=2, flag='0')]
+
+# 건물번호, 3시간 간격 전력사용량 중앙값, 요일에 따른 Group by
+# max값으로 나누어서 최대값이 1이 되도록 만듦
+agg_cl <- train_dt3[, .(M = median(used.power)), by=.(num, hour_by3, weekdays)]
+agg_cl[, R:= M/max(M), by=.(num)]
+
+# 건물에 따라서, 3시간대 x 요일의 전력사용량 정도를 확인
+dt_cl <- dcast(agg_cl, num ~ weekdays+hour_by3, value.var='R')
+
+
+# 계층적 군집화 및 시각화
+dist_building <- dist(dt_cl[, -1])
+hc_builing <- hclust(dist(dt_cl[, -1]), method='ward.D2')
+
+fviz_dend(hc_builing, k = 10,
+          cex = 0.5,
+          k_colors = RColorBrewer::brewer.pal(5, 'Set1'),
+          color_labels_by_k = TRUE,
+          rect = TRUE,
+          rect_border = RColorBrewer::brewer.pal(5, 'Set1'),
+          rect_fill = TRUE)
+
+
+# 군집 평균(중심)의 시각화
+dt_cl_result <- data.table(num=1:60,
+                           grp=LETTERS[cutree(hc_builing, k=5)])
+
+agg_cl[dt_cl_result, on=.(num), G := i.grp]
+agg_cl[, .(MM = mean(R)), by=.(G, hour_by3, weekdays)] %>%
+  ggplot(aes(hour_by3, weekdays, fill=MM)) + geom_tile()+
+  scale_fill_distiller(palette='YlGnBu', direction=1) +
+  facet_grid(cols=vars(G))
+
+# A : 요일/시간 상관없이 항상 전력사용량이 많음
+# B : 평일 낮시간에 전력사용량이 많으나 나머지 시간에도 50% 수준을 유지
+# C : 요일 상관없이 낮시간 전력사용량이 많음
+# D : B와 비슷하지만 평일 낮시간을 제외하고는 낮은 전력사용량
+# E : 저녁과 주말 낮 시간에 전력사용량이 많음
+
+
+train_dt3$seg <- NA
+valid_dt3$seg <- NA
+test_dt3 $seg <- NA
+for ( seg.i in 1:5 ){
+  train_dt3$seg[train_dt3$num %in% which(apply(table(agg_cl$G,agg_cl$num), 2, which.max) == seg.i)] <- seg.i
+  valid_dt3$seg[valid_dt3$num %in% which(apply(table(agg_cl$G,agg_cl$num), 2, which.max) == seg.i)] <- seg.i
+  test_dt3 $seg[test_dt3 $num %in% which(apply(table(agg_cl$G,agg_cl$num), 2, which.max) == seg.i)] <- seg.i
+}
+
+# train_dt3 %>%
+#   subset(., subset = seg==5) %>%
+#   select(num) %>% table
+# which(apply(table(agg_cl$G,agg_cl$num),2,which.max)==5)
+
+# rm needless obj.
+rm(agg_cl, dt_cl, dist_building, hc_builing, dt_cl_result, seg.i)
+
+
+#======================================================================================================#
+# >>>>> 6. 데이터 타입 정하기 ----
+#======================================================================================================#
+char.xvars <- c('non.elect.cooling','is.have.solar','AMPM','day.5','day.10','day.15','hour.3','hour.6','hour.12','weekdays','weekend','seg')
+num.xvars  <- c('temperature','wind.speed','humidity','rainfall','sunlight','day','hour')
+
+except.xvars <- c('day.5')
+
+for ( type.i in seq_along(char.xvars) ){
+  # type.i <- 1
+  train_dt3[[char.xvars[type.i]]] <- factor(train_dt3[[char.xvars[type.i]]])
+  valid_dt3[[char.xvars[type.i]]] <- factor(valid_dt3[[char.xvars[type.i]]], levels = levels(train_dt3[[char.xvars[type.i]]]))
+  test_dt3 [[char.xvars[type.i]]] <- factor(test_dt3 [[char.xvars[type.i]]], levels = levels(train_dt3[[char.xvars[type.i]]]))
+}
+
+#======================================================================================================#
+# >>>>> 7. test data / missing 값들 채워넣기 ----
+#======================================================================================================#
+missing.vars <- c('temperature','wind.speed','humidity','rainfall','sunlight')
+
+# subset(test_dt4, select = missing.vars)
+# desc_fn(subset(test_dt4,select=-c(time)))
+
+# missing 값들 채워넣기
+
+#--------------------------------------------------------------------------------------------------#
+# 7.1. missing값들 보간 (train 기준)
+# > 숫자형변수들은 median으로, 문자형변수들은 타입별 max값으로 보간
+#--------------------------------------------------------------------------------------------------#
+# 1차 : (day, hour)
+# 2차 : (num, hour)
+
+# (1) non.elect.cooling, is.have.solar : num별로 나누어져 있음
+train_dt3 %>% select(non.elect.cooling, num) %>% table
+train_dt3 %>% select(is.have.solar, num) %>% table
+
+# (1-1) non.elect.cooling
+non.elect.cooling.0 <- names(table(train_dt3$num[train_dt3$non.elect.cooling == 0]))
+non.elect.cooling.1 <- names(table(train_dt3$num[train_dt3$non.elect.cooling == 1]))
+
+test_dt3$non.elect.cooling[test_dt3$num %in% non.elect.cooling.0] <- 0
+test_dt3$non.elect.cooling[test_dt3$num %in% non.elect.cooling.1] <- 1
+
+# (1-2) is.have.solar
+is.have.solar.0 <- names(table(train_dt3$num[train_dt3$is.have.solar == 0]))
+is.have.solar.1 <- names(table(train_dt3$num[train_dt3$is.have.solar == 1]))
+
+test_dt3$is.have.solar[test_dt3$num %in% is.have.solar.0] <- 0
+test_dt3$is.have.solar[test_dt3$num %in% is.have.solar.1] <- 1
+
+
+
+train_dt3[, .N, by = .(num, day, hour.3)]
+
+# (2) 나머지는 trimmed mean으로 나누어 넣기
+missing_vars_intp_value <- ddply(train_dt3,.(num, day, hour.3),function(df){
+  # df <- subset(train_dt3, subset = (num==train_dt3$num[1]) & (hour==train_dt3$hour[1]))
+  
+  # trimmed mean
+  res.trimmed.num <- subset(df, select = missing.vars[1:5]) %>%
+    sapply(., function(x) mean(x, trim = 0.1, na.rm=T)) %>%
+    round(., 1)
+  names(res.trimmed.num) <- paste0(names(res.trimmed.num),'.trimmed')
+  
+  return(res.trimmed.num)
+}, .progress = 'text')
+
+
+#--------------------------------------------------------------------------------------------------#
+# 7.2. train으로 부터 얻은 missing 보간 값을 test에 JOIN
+#--------------------------------------------------------------------------------------------------#
+test_dt4 <- test_dt3 %>%
+  left_join(missing_vars_intp_value, 
+            by=c('num','day','hour.3'))
+
+# factor/char값들은 *1로 numeric으로 만들어줘야함
+query <- '
+select num, seg, time
+  , case when temperature         is null then [temperature.trimmed]     else temperature           end as [temperature]
+  , case when [wind.speed]        is null then [wind.speed.trimmed]      else [wind.speed]          end as [wind.speed]
+  , case when humidity            is null then [humidity.trimmed]        else humidity              end as [humidity]
+  , case when rainfall            is null then [rainfall.trimmed]        else rainfall              end as [rainfall]
+  , case when sunlight            is null then [sunlight.trimmed]        else sunlight              end as [sunlight]
+  , day, hour, [non.elect.cooling], [is.have.solar], [AMPM], [day.5], [day.10], [day.15], [hour.3], [hour.6], [hour.12], [weekdays], [weekend]
+  
+from test_dt4 a
+'
+
+test_dt5 <- sqldf(query) %>% setDT
+
+# missing값 확인
+is.na(test_dt5) %>% sum
+
+# type 다시 바꾸기
+test_dt5$non.elect.cooling <- factor(test_dt5$non.elect.cooling, levels=levels(train_dt3$non.elect.cooling))
+test_dt5$is.have.solar     <- factor(test_dt5$is.have.solar,     levels=levels(train_dt3$is.have.solar))
+
+# final data로 저장
+train_fn <- train_dt3
+valid_fn <- valid_dt3
+test_fn  <- test_dt5
+
+# rm needless obj.
+rm(train_dt3, valid_dt3, test_dt3, test_dt5)
+rm(missing.vars, query)
+
+save(train_fn, valid_fn, test_fn, file = 'RWS/tuning/data_fn.RData')
+
+
+#======================================================================================================#
+# >>>>> 8. NUM별 Model Fitting ----
+#======================================================================================================#
+
+graphics.off()
+n.num <- 60
+
+# h2o.removeAll()
+# h2o.shutdown(prompt = F)
+
+
+# 22600 sec = 6.3 hour
+result_ls <- list()
+system.time({
+  for ( num.i in 1:n.num ){
+    # num.i <- 1
+    
+    # quiet(h2o.init(nthreads = -1, max_mem_size = "8g"))
+    # h2o.shutdown(prompt = F)
+    
+    # start time
+    start.time <- Sys.time()
+    
+    # seg filter
+    train <- train_fn %>% filter(., num==num.i) %>% mutate(time = as.character(time))
+    
+    # validation set & test set
+    df <- valid_fn %>% filter(., num==num.i) %>% mutate(time = as.character(time))
+    
+    valid <- splitstackshape::stratified(df, group = c('num','hour'), size = 0.50)
+    test  <- setdiff(df, valid)
+    
+    # submission file
+    submission     <- test_fn %>% filter(., num==num.i) %>% mutate(time = as.character(time))
+    
+    # X,y
+    yvar  <- 'used.power'
+    xvars <- c(char.xvars, num.xvars)
+    
+    # sapply(train[,.SD,.SDcols=xvars], class)
+    
+    # unique한 변수들은 제거
+    unique.xvars <- train %>% .[, .SD, .SDcols=xvars] %>% 
+      sapply(., function(col){
+        tb <- table(col)
+        length(tb[tb!=0])
+      }) %>% 
+      as.data.frame %>%
+      filter(.==1) %>% 
+      rownames()
+    # train[, .SD, .SDcols = unique.xvars] %>% sapply(., table)
+    
+    xvars <- setdiff(xvars, unique.xvars)
+
+    #--------------------------------------------------------------------------
+    # tuning : https://www.h2o.ai/blog/h2o-gbm-tuning-tutorial-for-r/
+    #          https://statkclee.github.io/bigdata/h2o-gbm-titanic.html
+    #--------------------------------------------------------------------------
+    train_h2o      <- tryCatch(as.h2o(train, destination_frame = "train_h2o")       , error = function(e) 'ERROR')
+    valid_h2o      <- tryCatch(as.h2o(valid, destination_frame = "valid_h2o")       , error = function(e) 'ERROR')
+    test_h2o       <- tryCatch(as.h2o(test , destination_frame = "test_h2o")        , error = function(e) 'ERROR')
+    submission_h2o <- tryCatch(as.h2o(submission, destination_frame = 'test_fn_h2o'), error = function(e) 'ERROR')
+    
+    # 오래사용한 경우 h2o cluster를 restart해야함    
+    if ( sum(sapply(c(train_h2o,valid_h2o,test_h2o), length) %in% 1) >= 1 ) stop('\n ERROR : restart the h2o cluster')
+
+    #--------------------------------------------------------------------------
+    # 4.3. GBM 모수 미세조정
+    #--------------------------------------------------------------------------
+    stopping_metric <- c('deviance','RMSE')[1]
+    sort_by         <- c('residual_deviance','rmse')[1]
+    
+    hyper_params = list(max_depth = c(4,6,8,12,16,20)) # list( max_depth = seq(1,29,2) )
+    
+    grid <- h2o.grid(
+      
+      hyper_params = hyper_params,
+      search_criteria = list(strategy = "Cartesian"),
+      
+      algorithm = "gbm",
+      grid_id = "depth_grid",
+      
+      x = xvars, 
+      y = yvar, 
+      training_frame = train_h2o, 
+      validation_frame = valid_h2o,
+      
+      ntrees = 10000,                                                            
+      learn_rate = 0.05,                                                         
+      learn_rate_annealing = 0.99,                                               
+      
+      sample_rate = 0.8,                                                       
+      col_sample_rate = 0.8, 
+      
+      seed = seed.num,                                                             
+      
+      stopping_rounds = 5,
+      stopping_tolerance = 1e-4,
+      stopping_metric = stopping_metric, 
+      
+      score_tree_interval = 10                                                
+    )
+    
+    sortedGrid <- h2o.getGrid("depth_grid", sort_by=sort_by, decreasing = F)    
+    
+    topDepths = sortedGrid@summary_table$max_depth[1:5]                       
+    minDepth = min(as.numeric(topDepths))
+    maxDepth = max(as.numeric(topDepths))
+    
+    
+    #--------------------------------------------------------------------------
+    # 4.4. GBM 초모수 격자 탐색
+    #--------------------------------------------------------------------------
+    hyper_params = list( 
+      max_depth = unique(floor(seq(minDepth,maxDepth,length.out = 5))),  # 최대 5개로 제한
+      sample_rate = seq(0.2,1,0.1),                                             
+      col_sample_rate = seq(0.2,1,0.1),                                         
+      col_sample_rate_per_tree = seq(0.2,1,0.1),                                
+      col_sample_rate_change_per_level = seq(0.9,1.1,0.05),                      
+      min_rows = 2^seq(0,log2(nrow(train))-1,1),                                 
+      nbins = 2^seq(4,10,1),                                                     
+      nbins_cats = 2^seq(4,12,1),                                                
+      min_split_improvement = c(0,1e-8,1e-6,1e-4),                               
+      histogram_type = c("UniformAdaptive","QuantilesGlobal","RoundRobin")       
+    )
+    
+    search_criteria = list(
+      strategy = "RandomDiscrete",      
+      max_runtime_secs = 3600,         
+      max_models = 100,                  
+      seed = seed.num,                        
+      
+      stopping_rounds = 5,                
+      stopping_metric = stopping_metric,
+      stopping_tolerance = 1e-3
+    )
+    
+    grid <- h2o.grid(
+      
+      hyper_params = hyper_params,
+      search_criteria = search_criteria,
+      
+      algorithm = "gbm",
+      
+      grid_id = "final_grid", 
+      
+      x = xvars, 
+      y = yvar, 
+      training_frame = train_h2o, 
+      validation_frame = valid_h2o,
+      
+      ntrees = 10000,
+      learn_rate = 0.05,
+      learn_rate_annealing = 0.99,
+      max_runtime_secs = 3600,
+      stopping_rounds = 5, stopping_tolerance = 1e-4, stopping_metric = stopping_metric,
+      score_tree_interval = 10,                                                
+      seed = seed.num                                                             
+    )
+    
+    ## RMSLE 기준 격자모형 정렬
+    sortedGrid <- h2o.getGrid("final_grid", sort_by = sort_by, decreasing = F)
+    
+    # best model
+    best.model.idx <- 1
+
+    ##=========================================================================
+    ## 05. 최종 모형 정리
+    ##=========================================================================
+    gbm.fit      <- h2o.getModel(sortedGrid@model_ids[[best.model.idx]])
+    # gbm@model$validation_metrics@metrics$rmsle
+    # plot(gbm.fit)
+    
+    train_dt      <- as.data.frame(train_h2o)
+    valid_dt      <- as.data.frame(valid_h2o)
+    test_dt       <- as.data.frame(test_h2o)
+    submission_dt <- as.data.frame(submission_h2o)
+    
+    train_dt$predict      <- h2o.predict(gbm.fit,train_h2o)      %>% as.data.frame %>% unlist
+    valid_dt$predict      <- h2o.predict(gbm.fit,valid_h2o)      %>% as.data.frame %>% unlist
+    test_dt$predict       <- h2o.predict(gbm.fit,test_h2o)       %>% as.data.frame %>% unlist
+    submission_dt$predict <- h2o.predict(gbm.fit,submission_h2o) %>% as.data.frame %>% unlist
+
+    p1 <- data.frame(yhat=train_dt$predict, y=train_dt$used.power) %>%
+      ggplot(., aes(yhat, y)) +
+      geom_point() +
+      geom_abline(slope=1, intercept=0, col='red') +
+      labs(title=paste0('Train')) +
+      xlim(min(c(train_dt$predict, train_dt$used.power))*0.9, max(c(train_dt$predict, train_dt$used.power))*1.1) +
+      ylim(min(c(train_dt$predict, train_dt$used.power))*0.9, max(c(train_dt$predict, train_dt$used.power))*1.1) +
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    p2 <- data.frame(yhat=valid_dt$predict, y=valid_dt$used.power) %>%
+      ggplot(., aes(yhat, y)) +
+      geom_point() +
+      geom_abline(slope=1, intercept=0, col='red') +
+      labs(title=paste0('Valid')) +
+      xlim(min(c(valid_dt$predict, valid_dt$used.power))*0.9, max(c(valid_dt$predict, valid_dt$used.power))*1.1) +
+      ylim(min(c(valid_dt$predict, valid_dt$used.power))*0.9, max(c(valid_dt$predict, valid_dt$used.power))*1.1) +
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    p3 <- data.frame(yhat=test_dt$predict, y=test_dt$used.power) %>%
+      ggplot(., aes(yhat, y)) +
+      geom_point() +
+      geom_abline(slope=1, intercept=0, col='red') +
+      labs(title=paste0('Test')) +
+      xlim(min(c(test_dt$predict, test_dt$used.power))*0.9, max(c(test_dt$predict, test_dt$used.power))*1.1) +
+      ylim(min(c(test_dt$predict, test_dt$used.power))*0.9, max(c(test_dt$predict, test_dt$used.power))*1.1) +
+      theme(plot.title = element_text(hjust = 0.5))
+
+    # grid.arrange(p1, p2, p3, ncol=3)
+ 
+    # end time
+    end.time <- Sys.time()
+    what.x <- paste0('Prev. Fitting Time : ', 
+                     round(round(as.numeric(difftime(end.time, start.time, units = 'mins')),2), 1),
+                     ' Mins')
+    
+    # progress bar function
+    pb_fn(current = num.i, total = n.num, width = 80, what = what.x)
+    
+    result_ls[[num.i]] <- list(train           = train_dt,
+                               valid           = valid_dt,
+                               test            = test_dt,
+                               submission      = submission_dt,
+                               fit             = gbm.fit,
+                               plot.train      = p1,
+                               plot.test       = p2,
+                               plot.submission = p3,
+                               time            = gsub('Prev. Fitting Time : ','',what.x))
+    
+    assign_ls <- result_ls[[num.i]]
+    save(assign_ls, file = paste0('RWS/tuning/result_ls_',num.i,'.RData'))
+
+    # smape_fn(result_ls[[num.i]]$test$used.power, result_ls[[num.i]]$test$predict)
+    
+    rm(start.time, end.time, df, train, test, valid, submission, yvar, xvars, unique.xvars)
+    rm(train_h2o, valid_h2o, test_h2o, submission_h2o)
+    rm(stopping_metric, sort_by, hyper_params, grid, sortedGrid, topDepths, minDepth, maxDepth, search_criteria, best.model.idx)
+    rm(gbm.fit, train_dt, valid_dt, test_dt, submission_dt, p1, p2, p3, what.x, assign_ls)
+    
+    # h2o.shutdown(prompt = F)
+    h2o.removeAll()
+  }
+})
+
+# save the fitting result
+save(result_ls, file = 'result_ls_h2ogbm_tune.RData')
+# load('result_ls_tune.RData')
+
+
+
+
+
+
+
+# predict(h2o.getModel(gbm.fit.name), as.h2o(subset(test_fn,select = -c(time)),destination_frame = 'test_h2o'))
+
+n.num<-60
+yhat_ls <- lapply(result_ls, function(x) x$test$predict)
+y_ls    <- lapply(result_ls, function(x) x$test$used.power)
+
+names(yhat_ls) <- names(y_ls) <- 1:n.num
+
+result_ls2 <- lapply(1:n.num, function(iter){
+  # iter <- 1
+  res_df1 <- data.frame(NUM=iter, yhat=yhat_ls[[iter]])
+  res_df2 <- data.frame(NUM=iter, y=y_ls[[iter]])
+  
+  return(list(yhat=res_df1, y=res_df2))
+})
+
+# result
+result_df <- data.frame(
+  seg  = lapply(result_ls2, function(x) x[[1]]) %>% rbindlist %>% select(NUM),
+  yhat = lapply(result_ls2, function(x) x[[1]]) %>% rbindlist %>% select(yhat),
+  y    = lapply(result_ls2, function(x) x[[2]]) %>% rbindlist %>% select(y)
+)
+result_df$NUM <- as.factor(result_df$NUM)
+
+# test SMAPE
+smape_fn(result_df$y,result_df$yhat) # 2.073599
+
+smape_df <- split(result_df, result_df$NUM) %>%
+  sapply(., function(df) smape_fn(df$y,df$yhat)) %>%
+  data.frame(NUM=1:n.num, SMAPE=.)
+
+smape_df %>% filter(SMAPE > 3)
+ggplot(smape_df, aes(NUM, SMAPE)) + geom_bar(stat = 'identity') + geom_hline(yintercept=3, col = 2)
+
+
+
+# ALL
+graphics.off()
+
+for ( i in 1:6 ){
+  pb_fn(i,6)
+  sub <- subset(result_df,subset=NUM %in% (10*i-9):(10*i))
+  p   <- ggplot(sub, aes(yhat, y, col = NUM)) +
+    geom_point() + 
+    geom_abline(slope = 1, intercept = 0, col = 2)
+  print(p)
+}
+
+
+# SEG
+graphics.off()
+for ( i in 1:n.num ){
+  # i <- 1
+  p <- do.call('grid.arrange', c(result_ls[[i]][c('plot.tr','plot.te')], ncol=2))
+  ggsave(filename=paste0('OUT/2.tune/NUM',i,'.png'), plot=p, width=12, height=10)
+  dev.off()
+  
+  pb_fn(i,60)
+}
+
+
+#======================================================================================================#
+# >>>>> 6. sample_submission에 맞도록 양식변경 ----
+#======================================================================================================#
+result_ls2 <- list()
+system.time({
+  for ( num.i in 1:n.num ){
+    
+    # num.i <- 1  
+    
+    # progress bar function
+    pb_fn(current = num.i, total = n.num)
+    
+    temp     <- test_fn %>% filter(., num==num.i)
+    temp$time <- as.character(temp$time)
+    
+    temp_h2o <- as.h2o(temp, destination_frame = "temp_h2o")
+    
+    # h2o.getModel(result_ls[[num.i]]$fit.name)
+    temp_h2o$predict <- h2o.predict(result_ls[[num.i]]$fit, temp_h2o)
+    
+    result_ls2[[num.i]] <- temp_h2o %>% as.data.table()
+    
+    rm(temp,temp_h2o)
+  }
+})
+
+result_df2 <- result_ls2 %>% rbindlist
+
+# num_date_time, answer
+result_df3 <- data.frame(
+  num_date_time = paste0(result_df2$num,
+                         ' ',
+                         substr(result_df2$time,1,13)),
+  answer = result_df2$predict
+)
+
+# join
+sample_submission <- fread('sample_submission.csv', header = T, stringsAsFactors = F, sep = ',')
+
+final_submission <- sample_submission %>%
+  subset(., select = num_date_time) %>%
+  left_join(result_df3, by = c('num_date_time'))
+
+# check the na values
+final_submission[which(is.na(final_submission$answer)),]
+# subset(result_df2, subset = (num==5 & day==25))
+
+# write the result
+write.csv(final_submission, file = 'sample_submission_fn9.csv', row.names = F)
+
+
+miss.1 <- read.csv('sample_submission_fn.csv',header=T,stringsAsFactors = F)
+miss.2 <- read.csv('sample_submission_fn7.csv',header=T,stringsAsFactors = F)
+miss.3 <- final_submission
+
+sqrt(sum((miss.1$answer-miss.2$answer)^2))
+sqrt(sum((miss.1$answer-miss.3$answer)^2))
+
+smape_fn(miss.1$answer,miss.2$answer)
+smape_fn(miss.1$answer,miss.3$answer)
+
+
