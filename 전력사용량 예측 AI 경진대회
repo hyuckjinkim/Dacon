@@ -1,0 +1,946 @@
+#===============================================================================================#
+# 파 일 명 : 전력사용량 예측 AI 경진대회
+# 시작날짜 : 2021.05.18
+# 수정날짜 : 2021.06.29
+# 작 성 자 : 김혁진
+# 작성주제 : Dacon / 7. 전력사용량 예측 AI 경진대회
+#===============================================================================================#
+# >>>>> 순서 ----
+# 
+# 0. 기본설정 : Env 초기화, Path 지정, Package Load, pbapply opt.
+# 1. Data Load
+# 2. test data / missing 값들 채워넣기
+# 3. 파생변수 생성
+# 4. outlier check
+# 5. num에 따른 전력사용량 Plot 확인
+# 6. SEG 생성
+# 7. 데이터 타입 정하기
+# 8. NUM별 Model Fitting
+# 9. sample_submission에 맞도록 양식변경
+#
+#===============================================================================================#
+
+
+
+#======================================================================================================#
+# >>>>> 0. 기본설정 : Env 초기화, Path 지정, Package Load, pbapply opt. ----
+#======================================================================================================#
+
+# Env 초기화
+rm(list=ls())
+invisible(gc(reset=T))
+
+# user defined function
+# 필요한 패키지들을 설치 및 load
+Packages_fn <- function(pkg){
+  
+  # pkg = "Boruta"
+  
+  # 설치되어있는 패키지들 모음
+  installed.pkg <- rownames(installed.packages())
+  
+  # 패키지가 설치되어있지 않으면, 설치되지않은 패키지들을 설치
+  if ( length(setdiff(pkg, installed.pkg)) > 0 ) {
+    install.packages(setdiff(pkg, installed.pkg))  
+  }
+  
+  # require
+  invisible(
+    sapply(pkg, function(element){ 
+      eval(parse(text = paste0("require(", element, ", quietly = TRUE)")))
+    })
+  )
+}
+
+smape_fn <- function(actual,predict){
+  smape <- 100*mean( abs(actual-predict)/(abs(actual)+abs(predict)) )
+  return(smape)
+}
+
+pb_fn <- function(current, total, width = 50, what = ""){
+  
+  # what    <- c("","Fitting")[2]
+  # current <- 1000
+  # total   <- 1000
+  # width   <- 50
+  
+  # (1) : "="
+  bar1 <- rep("=", floor(current/total*width))
+  bar1 <- paste(bar1, collapse = "")
+  
+  # (2) : ">"
+  bar2 <- ifelse(bar1=="","",">")
+  
+  # (3) : "-"
+  bar3 <- rep("-", ifelse(current == total, 0, width - nchar(bar1) - nchar(bar2)))
+  bar3 <- paste(bar3, collapse = "")
+  
+  # (1,2,3,) : "===>----"
+  bar <- paste0(bar1,bar2,bar3)
+  
+  # spacing : 끝쪽에 공백을만들어서, 긴 문자가 남지않도록 하는거
+  spacing <- paste0(rep(" ", 40), collapse = "")
+  
+  # sprintf : progress
+  cat(sprintf(paste0("\r%s [%-", width,"s] ", current, "/", total, " (%g%%)", spacing), 
+              what, bar, round(current/total*100,0)),
+      file = stderr())
+}
+
+
+# Grapics Off
+graphics.off()
+
+# 작업 디렉토리 설정
+setwd('F:/USB포맷_210223/STUDY/Dacon/7. 전력사용량 예측 AI 경진대회')
+
+# seed 설정
+seed.num <- 7777777
+
+# user defined function
+# : Packages_fn, smape_fn
+# source('F:/USB포맷_210223/STUDY/User Defined Function/R_function.R', encoding = 'UTF-8')
+
+# package name
+pkg <- c("plyr","dplyr","data.table","pbapply","Metrics","splitstackshape","ggplot2","factoextra","gridExtra","gbm","h2o","zoo","sqldf",
+         "devtools","lgbdl","lightgbm","Matrix","ddpcr","mltools")
+# Metrics : smape function
+# splitstackshape : stratified
+# factoextra : fviz_dend
+# zoo : na.locf
+# ddpcr : quiet
+# lightgbm : devtools, lgbdl, lightgbm
+# Matrix : lightgbm data type -> sparse
+# mltools : one_hot
+
+# require libraries
+Packages_fn(pkg)
+
+# pbapply library options
+pboptions(type = "timer", style = 3, char = "=")
+
+# devtools for lightgbm
+options(devtools.install.args = "--no-multiarch")
+
+# rm needless obj.
+rm(pkg)
+
+
+#======================================================================================================#
+# >>>>> 1. Data Load ----
+#======================================================================================================#
+
+train_dt <- fread('DAT/train.csv', header = T, stringsAsFactors = F, sep = ',')
+test_dt  <- fread('DAT/test.csv' , header = T, stringsAsFactors = F, sep = ',')
+
+col.nm   <- c('num','time','used.power','temperature','wind.speed','humidity','rainfall','sunlight','non.elect.cooling','is.have.solar')
+
+colnames(train_dt) <- col.nm
+colnames(test_dt)  <- col.nm[-3]
+
+# format datetime
+train_dt[, time := as.POSIXct(paste0(time,':00:00'), format = "%Y-%m-%d %H:%M:%S")]
+test_dt [, time := as.POSIXct(paste0(time,':00:00'), format = "%Y-%m-%d %H:%M:%S")]
+
+# 데이터 확인
+train_dt %>% select(-c(time)) %>% desc_fn()
+
+# 변수 확인
+colnames(train_dt)
+# 1. num : 건물번호
+# 2. time : 시간
+# 3. used.power : 전력사용량(kWh)
+# 4. temperature : 기온('C)
+# 5. wind.speed : 풍속(m/s)
+# 6. humidity : 습도(%)
+# 7. rainfall : 강수량(mm)
+# 8. sunlight : 일조(hr)
+# 9. non.elect.cooling : 비전기냉방설비운영
+# 10. is.have.solar : 태양광보유여부
+
+# # 간단하게 튀는값 확인
+# par(mfrow=c(3,2))
+# table(train_dt$num)
+# boxplot(train_dt$used.power ~ train_dt$num)
+# boxplot(train_dt$temperature ~ train_dt$num)
+# boxplot(train_dt$wind.speed ~ train_dt$num)
+# boxplot(train_dt$humidity ~ train_dt$num)
+# boxplot(train_dt$rainfall ~ train_dt$num)
+# boxplot(train_dt$rainfall ~ train_dt$num)
+# table(train_dt$sunlight)
+# table(train_dt$non.elect.cooling)
+# table(train_dt$is.have.solar)
+
+# rm needless obj.
+rm(col.nm)
+
+
+
+
+
+
+
+#======================================================================================================#
+# >>>>> 2. test data / missing 값들 채워넣기 ----
+#======================================================================================================#
+
+#--------------------------------------------------------------------------------------------------#
+# (1) non.elect.cooling, is.have.solar : num별로 나누어져 있음
+#--------------------------------------------------------------------------------------------------#
+train_dt %>% select(non.elect.cooling, num) %>% table
+train_dt %>% select(is.have.solar, num)     %>% table
+
+# (1-1) non.elect.cooling
+non.elect.cooling.0 <- names(table(train_dt$num[train_dt$non.elect.cooling == 0]))
+non.elect.cooling.1 <- names(table(train_dt$num[train_dt$non.elect.cooling == 1]))
+
+test_dt$non.elect.cooling[test_dt$num %in% non.elect.cooling.0] <- 0
+test_dt$non.elect.cooling[test_dt$num %in% non.elect.cooling.1] <- 1
+
+# (1-2) is.have.solar
+is.have.solar.0 <- names(table(train_dt$num[train_dt$is.have.solar == 0]))
+is.have.solar.1 <- names(table(train_dt$num[train_dt$is.have.solar == 1]))
+
+test_dt$is.have.solar[test_dt$num %in% is.have.solar.0] <- 0
+test_dt$is.have.solar[test_dt$num %in% is.have.solar.1] <- 1
+
+
+#--------------------------------------------------------------------------------------------------#
+# (2) 기온,풍속,습도,강수량,일조량은 approx 함수로채워넣기
+#     > 첫번째값, 마지막값의 NA는 prediction이 불가능해서 가장근처의 값으로 매꿈(na.locf)
+#
+# locf : Last Observed Carried Forward 방식으로, trailing 되는 마지막의 NA값들을 마지막 관측된 방식으로 채워준다. 
+#        여기에 fromLast옵션을 주면 뒤에서 관측된걸 앞으로 땡길수도 있다.
+# 출처: https://gorakgarak.tistory.com/1224
+#--------------------------------------------------------------------------------------------------#
+missing.vars <- c('temperature','wind.speed','humidity','rainfall','sunlight')
+
+# subset(test_dt, select = missing.vars)
+# desc_fn(subset(test_dt,select=-c(time)))
+
+# missing 값들 채워넣기
+
+test_dt[, .N, by = .(num)] %>% head
+
+test_dt2 <- ddply(test_dt, .(num), function(df){
+  # df <- test_dt %>% filter(num==1)
+
+  res_df <- df %>% # select(c(time, missing.vars)) %>%
+    mutate(temperature = approx(time, temperature, xout = time, method = 'linear')$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+    mutate(wind.speed  = approx(time, wind.speed , xout = time, method = 'linear')$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+    mutate(humidity    = approx(time, humidity   , xout = time, method = 'linear')$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+    mutate(rainfall    = approx(time, rainfall   , xout = time, method = 'linear')$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+    mutate(sunlight    = approx(time, sunlight   , xout = time, method = 'linear')$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T))
+  
+  # # spline : 풍속이 (-) 되는 등 잘못나옴, 데이터에 맞지않은듯
+  # df %>%
+  #   mutate(temperature = spline(time, temperature, xout = time)$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+  #   mutate(wind.speed  = spline(time, wind.speed , xout = time)$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+  #   mutate(humidity    = spline(time, humidity   , xout = time)$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+  #   mutate(rainfall    = spline(time, rainfall   , xout = time)$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T)) %>%
+  #   mutate(sunlight    = spline(time, sunlight   , xout = time)$y %>% na.locf(., na.rm = F) %>% na.locf(., fromLast = T))
+  
+  return(res_df)
+  
+}, .progress = 'text') %>% setDT
+
+# 0보다 작은값들을 가지고 있는지 확인
+test_dt2 %>%
+  select(missing.vars) %>%
+  filter_all(any_vars(.<0))
+
+# plot
+test_dt2 %>%
+  select(c(num, time, missing.vars)) %>%
+  reshape2::melt(., id.vars = c('num','time')) %>%
+  ggplot(aes(time,value, col = num)) +
+  geom_line() +
+  scale_x_datetime(date_labels = '%y.%m.%d') +
+  facet_wrap(~variable, scales = 'free')
+graphics.off()
+
+# 숫자 맞추기 위해서
+train_dt2 <- train_dt
+
+
+rm(train_dt, test_dt, is.have.solar.0, is.have.solar.1, non.elect.cooling.0, non.elect.cooling.1)
+
+
+
+# # 이전에시도한방법 -> time series라서 주변값들의 영향이큼 -> 이런 방법은 잘 안먹힘
+# #--------------------------------------------------------------------------------------------------#
+# # (1) missing값들 보간 (train 기준)
+# # > 나머지는 trimmed mean으로 나누어 넣기
+# #--------------------------------------------------------------------------------------------------#
+# train_dt[, .N, by = .(num, hour)]
+# train_dt %>% 
+#   filter(num==1,hour==0) %>%
+#   select(temperature) %>%
+#   boxplot
+# 
+# missing_vars_intp_value <- ddply(train_dt,.(num, day, hour),function(df){
+#   # df <- subset(train_dt, subset = (num==train_dt$num[1]) & (hour==train_dt$hour[1]))
+#   
+#   # trimmed mean
+#   res.trimmed.num <- subset(df, select = missing.vars[1:5]) %>%
+#     sapply(., function(x) mean(x, trim = 0.1, na.rm=T)) %>%
+#     round(., 1)
+#   names(res.trimmed.num) <- paste0(names(res.trimmed.num),'.trimmed')
+#   
+#   return(res.trimmed.num)
+# }, .progress = 'text')
+# 
+# 
+# #--------------------------------------------------------------------------------------------------#
+# # (2) train으로 부터 얻은 missing 보간 값을 test에 JOIN
+# #--------------------------------------------------------------------------------------------------#
+# test_dt2 <- test_dt %>%
+#   left_join(missing_vars_intp_value,
+#             by=c('num','day','hour.3'))
+# 
+# # factor/char값들은 *1로 numeric으로 만들어줘야함
+# query <- '
+# select num, time
+# 
+# , case when temperature         is null then [temperature.trimmed]     else temperature           end as [temperature]
+# , case when [wind.speed]        is null then [wind.speed.trimmed]      else [wind.speed]          end as [wind.speed]
+# , case when humidity            is null then [humidity.trimmed]        else humidity              end as [humidity]
+# , case when rainfall            is null then [rainfall.trimmed]        else rainfall              end as [rainfall]
+# , case when sunlight            is null then [sunlight.trimmed]        else sunlight              end as [sunlight]
+# 
+# , [non.elect.cooling], [is.have.solar]
+# , month, day, hour, AMPM, [day.5], [day.10], [day.15], [hour.3], [hour.6], [hour.12]
+# , [weekdays], [weekend], [discomfort.index], [discomfort.index.grp], [sensible.temperature], seg, [is.used]
+# 
+# from test_dt2 a
+# '
+# 
+# test_dt3 <- sqldf(query) %>% setDT
+
+
+
+
+
+
+
+
+
+
+
+
+
+#======================================================================================================#
+# >>>>> 3. 파생변수 생성 ----
+#======================================================================================================#
+
+# 파생변수 생성
+new_feature_fn <- function(dt){
+  
+  # dt <- train_dt2
+  
+  # 2.1. year,month,day,hour
+  dt[, year := as.numeric(format(time, format = '%Y')) # year
+  ][, month := as.numeric(format(time, format = '%m')) # month
+  ][, day   := as.numeric(format(time, format = '%d')) # day
+  ][, hour  := as.numeric(format(time, format = '%H')) # hour
+  ]
+  
+  # 2.2. 보름,계절 
+  dt[, onehot.spring := ifelse(month %in% c('3','4','5') ,1,0) # spring one-hot coding
+  ][, onehot.summer := ifelse(month %in% c('6','7','8')  ,1,0) # summer one-hot coding
+  ][, onehot.fall   := ifelse(month %in% c('9','10','11'),1,0) # fall   one-hot coding
+  ][, onehot.winter := ifelse(month %in% c('12','1','2') ,1,0) # winter one-hot coding
+  ]
+  
+  # 2.3. Am/Pm
+  dt[, AMPM := ifelse(hour<12,'AM','PM')] # AM : 0~11시 : 1, PM : 12시~23시
+  
+  # 2.4. 5일간격
+  dt[, day.5 := ifelse(day<=5,'1~5',
+                       ifelse(day<=10,'6~10',
+                              ifelse(day<=15,'11~15',
+                                     ifelse(day<=20,'16~20',
+                                            ifelse(day<=25,'21~25',
+                                                   ifelse(day<=31,'26~31','error'))))))]
+  
+  # 2.5. 10일 간격
+  dt[, day.10 := ifelse(day<=10,'1~10',
+                        ifelse(day<=20,'11~20',
+                               ifelse(day<=31,'21~31','error')))]
+  
+  # 2.6. 15일 간격
+  dt[, day.15 := ifelse(day<=15,'1~15','16~31')]
+  
+  # 2.7. 3시간 간격
+  dt[, hour.3 := ifelse(hour<=2,'0~2',
+                        ifelse(hour<=5,'3~5',
+                               ifelse(hour<=8,'6~8',
+                                      ifelse(hour<=11,'9~11',
+                                             ifelse(hour<=14,'12~14',
+                                                    ifelse(hour<=17,'15~17',
+                                                           ifelse(hour<=20,'18~20',
+                                                                  ifelse(hour<=23,'21~23','error'))))))))]
+  
+  # 2.8. 6시간 간격
+  dt[, hour.6 := ifelse(hour<=5,'0~5',
+                        ifelse(hour<=11,'6~11',
+                               ifelse(hour<=17,'12~17','18~23')))]
+  
+  # 2.9. 12시간 간격
+  dt[, hour.12 := ifelse(hour<=11,'0~11','12~23')]
+  
+  # 2.10 요일 및 주말여부
+  dt[, weekdays := as.numeric(format(time, format = '%u'))
+  ][, weekend   := ifelse(weekdays %in% c(6,7),'1','0')]
+  
+  # 2.11 불쾌지수=1.8x기온–0.55x(1–습도)x(1.8x기온–26)+32
+  # (출처) https://www.kma.go.kr/HELP/basic/help_01_05.jsp
+  #
+  # 1 : '전원 쾌적함을 느낌'
+  # 2 : '불쾌감을 나타내기 시작함'
+  # 3 : '50% 정도 불쾌감을 느낌'
+  # 4 : '전원 불쾌감을 느낌'
+  dt[, discomfort.index     := 1.8*temperature - 0.55*(1-humidity/100) * (1.8*temperature-26) + 32 
+  ][, discomfort.index.grp := ifelse(discomfort.index < 68, '1',
+                                     ifelse(discomfort.index < 75, '2',
+                                            ifelse(discomfort.index < 80, '3', '4')))]
+  
+  # 2.12 체감온도
+  # (출처) http://www.weather.go.kr/weather/lifenindustry/li_asset/HELP/basic/help_01_07.jsp
+  # m/s = 3.6 km/h
+  dt[, sensible.temperature := 13.12 + 0.6215*temperature - 11.37*(3.6*wind.speed)^0.16 + 0.3965*((3.6*wind.speed)^0.16)*temperature]
+  
+  # 2.13 비가온지 안온지, 
+  #      강수정도(출처 : https://m.blog.naver.com/kma_131/222073284939)
+  #      -> 매우 강한 비는 train에서 freq=0인곳이존재하고 test에서는 freq!=0인곳이존재해서 fitting을 할수가없음 -> 제거
+  #
+  # 1 : '비가 오지 않음'
+  # 2 : '약한 비'
+  # 3 : '보통'
+  # 4 : '강한 비'
+  dt[, is.rain := ifelse(rainfall==0,'0','1')
+  ][, rainfall.grp := ifelse(rainfall==0,'1',
+                             ifelse(rainfall<3,'2',
+                                    ifelse(rainfall<15,'3','4')))]
+  
+  # 2.14 화씨온도/절대온도
+  dt[, temperature.f := 9/5*temperature + 32
+  ][, temperature.k := temperature + 273]
+  
+  # 2.15 코로나 거리두기 단계
+  # (출처) https://ko.wikipedia.org/wiki/%EC%82%AC%ED%9A%8C%EC%A0%81_%EA%B1%B0%EB%A6%AC%EB%91%90%EA%B8%B0
+  dt[, month_day := as.numeric(paste0(format(time, format = '%m'),day))
+  ][, covid.distance := ifelse(month_day<816,'1단계','2단계')]
+  
+  #--------------------------------------------------------------------------------------------------#
+  # 의미없는 변수 삭제
+  #--------------------------------------------------------------------------------------------------#
+  
+  # dt$time <- NULL
+  
+  # dt$time  <- NULL
+  # dt$month <- NULL # 6,7,8월밖에 없음
+  
+  dt$year          <- NULL # 전부 2020년
+  dt$onehot.spring <- NULL # 모두 여름임
+  dt$onehot.summer <- NULL
+  dt$onehot.fall   <- NULL
+  dt$onehot.winter <- NULL
+  dt$temperature.k <- NULL # 단지 +273만 있으니깐 제거
+  
+  return(dt)
+}
+
+train_dt3 <- new_feature_fn(train_dt2)
+test_dt3  <- new_feature_fn(test_dt2)
+
+
+# 각 NUM별로 freq = 0인 것들 확인
+zero.vari <- train_dt3 %>% 
+  select(c(1,11:22,24,26,27)) %>% # 문자형변수만 추출
+  lapply(., factor) %>%           # as.factor
+  as.data.frame %>%
+  ddply(., .(num), function(dt){  # freq = 0인 변수들 개수파악
+    # dt <- zero.vari %>% select(-c(time,used.power,temperature,wind.speed,humidity,rainfall,sunlight,non.elect.cooling,is.have.solar)) %>% filter(num == 1)
+    dt2 <- dt %>% select(-c(num))
+    sapply(dt2, function(col){
+      sum(table(col)==0)
+    })
+  }, .progress = 'text')
+
+# 이상없음
+zero.vari %>%
+  select(-c(num)) %>%
+  filter_all(any_vars(.!=0))
+
+
+
+
+
+# rm needless obj.
+rm(train_dt2, test_dt2, zero.vari)
+
+
+# # (출처) https://dacon.io/competitions/official/235736/codeshare/2643?page=1&dtype=recent
+# # 특정 건물의 요일/시간별 전력사용량
+# graphics.off()
+# for ( i in 1:5){
+#   # i <- 1
+#   p <- train_dt3[num==i, .(M = median(used.power)), by=.(hour, weekdays)] %>%
+#     ggplot(aes(hour, weekdays, fill=M)) +
+#     geom_tile() +
+#     scale_fill_distiller(palette='YlGnBu', direction=-1) +
+#     ggtitle(paste0(i, '번째 건물'))
+#   plot(p)
+# }
+
+
+
+
+#======================================================================================================#
+# >>>>> 4. outlier check ----
+#======================================================================================================#
+
+# 의심가는거
+# 1,9, 16, 24, 25, (27), 31, 33, 36, 45, 49, 55, 60
+num.grp <- c(1,9,16,24,25,27,31,33,36,45,49,55,60)
+train_dt3 %>%
+  filter(num %in% num.grp) %>%
+  ggplot(aes(time,used.power)) +
+  geom_line() +
+  scale_x_datetime(date_labels = '%y.%m.%d') +
+  facet_wrap(~num, scales = 'free')
+
+# 하나씩 확인
+
+# 
+train_dt3 %>%
+  filter(num %in% 1) %>%
+  ggplot(aes(time,used.power)) +
+  geom_line() +
+  scale_x_datetime(date_labels = '%y.%m.%d')
+
+# 16
+train_dt3 %>%
+  filter(num == 16, month == 6, day == 27) %>%
+  select(c(time,used.power))
+
+# 31
+train_dt3 %>%
+  filter(num == 31, month == 6, day == 11) %>%
+  select(c(time,used.power))
+
+# 33
+train_dt3 %>%
+  filter(num == 33, month == 6, day == 11) %>%
+  select(c(time,used.power))
+
+
+
+
+
+
+# 31,33은 확실히 이상하므로, approx로 값을 맞춰줌
+
+# (1) 31
+idx.31 <- with(num==31 & month == 6 & day == 27 & hour == 17, data = train_dt3)
+train_dt3$used.power[idx.31] <- NA
+
+num_31_dt <- train_dt3 %>%
+  filter(num==31) %>%
+  select(time, used.power)
+
+na.idx.31 <- which(is.na(num_31_dt$used.power))
+num_31_dt$used.power.new <- approx(x = num_31_dt$time, y = num_31_dt$used.power, xout = num_31_dt$time)$y
+# num_31_dt[(na.idx.31-5):(na.idx.31+5), ]
+
+train_dt3$used.power[idx.31] <- num_31_dt$used.power.new[na.idx.31]
+
+# (2) 33
+idx.33 <- with(num==33 & month == 6 & day == 27 & hour == 17, data = train_dt3)
+train_dt3$used.power[idx.33] <- NA
+
+num_33_dt <- train_dt3 %>%
+  filter(num==33) %>%
+  select(time, used.power)
+
+na.idx.33 <- which(is.na(num_33_dt$used.power))
+num_33_dt$used.power.new <- approx(x = num_33_dt$time, y = num_33_dt$used.power, xout = num_33_dt$time)$y
+# num_33_dt[(na.idx.33-5):(na.idx.33+5), ]
+
+train_dt3$used.power[idx.33] <- num_33_dt$used.power.new[na.idx.33]
+
+
+
+
+# new
+train_dt4 <- train_dt3
+test_dt4  <- test_dt3
+
+# rm needless obj.
+rm(train_dt3, test_dt3)
+rm(idx.31, idx.33, num_31_dt, num_33_dt, na.idx.31, na.idx.33, num.grp)
+
+
+
+
+
+# ======================================================================================================#
+# >>>>> 5. num에 따른 전력사용량 Plot 확인 ----
+# ======================================================================================================#
+# pblapply(1:60, function(num.i){
+# 
+#   # num.i <- 1
+# 
+#   graphics.off()
+#   sub <- subset(train_dt4, subset = (num==num.i))
+#   x   <- sub$time[order(sub$time)]
+#   y   <- sub$used.power[order(sub$time)]
+# 
+#   # png(paste0('F:/USB포맷_210223/STUDY/Dacon/7. 전력사용량 예측 AI 경진대회/OUT/NUM',num.i,'.png'),
+#   #     width=480*3, height=480*2)
+# 
+#   par(mfrow=c(1,2), oma=c(0,0,2,0))
+# 
+#   plot(x,y,pch='.', type='l', xaxt='n', xlab = 'Time', ylab = 'Target')
+#   axis.POSIXct(1,
+#                at = seq(min(x), max(x), by = 'months'),
+#                labels = format(seq(min(x), max(x), by = 'months'), "%y/%m"),
+#                las=2)
+#   abline(h=median(y), col=2)
+# 
+#   boxplot(y)
+# 
+#   mtext(paste0('NUM : ', num.i), outer=T, cex=1.5)
+# 
+#   dev.off()
+# }) %>% invisible
+# 
+# graphics.off()
+# boxplot(train_dt4$used.power ~ train_dt4$day)
+# boxplot(train_dt4$used.power ~ train_dt4$non.elect.cooling)
+# boxplot(train_dt4$used.power ~ train_dt4$is.have.solar)
+
+
+#======================================================================================================#
+# >>>>> 6. SEG 생성 ----
+#======================================================================================================#
+
+# (출처) https://dacon.io/competitions/official/235736/codeshare/2643?page=1&dtype=recent
+
+# 특정 건물의 요일/3시간별 전력사용량
+train_dt4[, hour_by3 := formatC((as.integer(format(time, format='%H')) %/% 3)*3, width=2, flag='0')]
+
+# 건물번호, 3시간 간격 전력사용량 중앙값, 요일에 따른 Group by
+# max값으로 나누어서 최대값이 1이 되도록 만듦
+agg_cl <- train_dt4[, .(M = median(used.power)), by=.(num, hour, weekdays)]
+agg_cl[, R:= M/max(M), by=.(num)]
+
+# 건물에 따라서, 3시간대 x 요일의 전력사용량 정도를 확인
+dt_cl <- dcast(agg_cl, num ~ weekdays+hour, value.var='R')
+
+
+# 계층적 군집화 및 시각화
+dist_building <- dist(dt_cl[, -1])
+hc_builing <- hclust(dist(dt_cl[, -1]), method='ward.D2')
+
+fviz_dend(hc_builing, k = 10,
+          cex = 0.5,
+          k_colors = RColorBrewer::brewer.pal(5, 'Set1'),
+          color_labels_by_k = TRUE,
+          rect = TRUE,
+          rect_border = RColorBrewer::brewer.pal(5, 'Set1'),
+          rect_fill = TRUE)
+
+graphics.off()
+
+# 군집 평균(중심)의 시각화
+dt_cl_result <- data.table(num=1:60,
+                           grp=LETTERS[cutree(hc_builing, k=5)])
+
+agg_cl[dt_cl_result, on=.(num), G := i.grp]
+agg_cl[, .(MM = mean(R)), by=.(G, hour, weekdays)] %>%
+  ggplot(aes(hour, weekdays, fill=MM)) + geom_tile()+
+  scale_fill_distiller(palette='YlGnBu', direction=1) +
+  facet_grid(cols=vars(G))
+graphics.off()
+
+# A : 요일/시간 상관없이 항상 전력사용량이 많음
+# B : 평일 낮시간에 전력사용량이 많으나 나머지 시간에도 50% 수준을 유지
+# C : 요일 상관없이 낮시간 전력사용량이 많음
+# D : B와 비슷하지만 평일 낮시간을 제외하고는 낮은 전력사용량
+# E : 저녁과 주말 낮 시간에 전력사용량이 많음
+
+train_dt4$seg <- NA
+test_dt4 $seg <- NA
+for ( seg.char in LETTERS[1:5] ){
+  # seg.char <- 'A'
+  
+  num <- agg_cl %>% filter(G==seg.char) %>% select(num) %>% table %>% rownames
+  train_dt4$seg[train_dt4$num %in% num] <- seg.char
+  test_dt4 $seg[test_dt4 $num %in% num] <- seg.char
+}
+train_dt4 %>% select(c(num,seg)) %>% table
+
+
+#--------------------------------------------------------------------------------------------------#
+# 파생변수 생성 : 전력사용여부 : 해당 NUM 내에서의 전력사용이 일정수준 이상이면 1 아니면 0
+#--------------------------------------------------------------------------------------------------#
+
+# 1. num별로 hour vs weekdays에 대해 전력사용량 비중를 계산
+a1 <- agg_cl[, .(MM = mean(R)), by=.(num, hour, weekdays)] %>%
+  setorder(., num,hour,weekdays)
+
+# 2. hour 통틀어서 전력사용량 비중의 median값을 산출 
+#    -> (해당 시간대의 전력사용량)이 (전체시간대의 전력사용량의 중앙값)보다 크면 전력사용여부 = 1로 설정
+a2 <- a1[, .(MMM = median(MM)), by=.(num, weekdays)] # group by에서 hour 빠짐 : hour 통틀어서 median 값
+
+# 3. 전체시간대의 전력사용량의 중앙값을 원래 데이터에 조인
+query <- '
+select N01.*, N02.MMM
+from a1 N01
+left join a2 N02
+on N01.num=N02.num and N01.weekdays=N02.weekdays
+'
+
+# 4. -> (해당 시간대의 전력사용량)이 (전체시간대의 전력사용량의 중앙값)보다 크면 전력사용여부 = 1로 설정
+a3 <- sqldf(query) %>% 
+  setorder(., num,weekdays,hour) %>%
+  mutate(is.used = ifelse(MM>MMM,1,0))
+
+# 필요한 컬럼만 남기기
+a4 <- a3 %>%
+  select(num,hour,weekdays,is.used)
+
+# 기존 데이터에 붙이기
+train_dt5 <- train_dt4 %>% left_join(., a4, by = c('num','hour','weekdays')) %>% setorder(num,time)
+test_dt5  <- test_dt4  %>% left_join(., a4, by = c('num','hour','weekdays')) %>% setorder(num,time)
+
+# row수 늘어났는지 확인
+nrow(train_dt5); nrow(train_dt4)
+nrow(test_dt5);  nrow(test_dt4)
+
+
+
+# final data로 저장
+train_fn <- train_dt5
+test_fn  <- test_dt5
+
+# rm needless obj.
+rm(agg_cl, dt_cl, dist_building, hc_builing, dt_cl_result, seg.char, query, num)
+rm(a1,a2,a3,a4)
+rm(train_dt4, train_dt5, test_dt4, test_dt5)
+
+
+#======================================================================================================#
+# >>>>> 7. 데이터 타입 정하기 ----
+#======================================================================================================#
+char.xvars <- c('non.elect.cooling','is.have.solar','month','day','hour','AMPM','day.5','day.10','day.15','hour.3','hour.6','hour.12',
+                'weekdays','weekend','discomfort.index.grp','is.rain','rainfall.grp','is.used')
+num.xvars  <- c('temperature','wind.speed','humidity','rainfall','sunlight','discomfort.index','sensible.temperature','covid.distance')
+
+for ( type.i in seq_along(char.xvars) ){
+  # type.i <- 1
+  train_fn[[char.xvars[type.i]]] <- factor(train_fn[[char.xvars[type.i]]])
+  test_fn [[char.xvars[type.i]]] <- factor(test_fn [[char.xvars[type.i]]], levels = levels(train_fn[[char.xvars[type.i]]]))
+}
+
+# rm needless obj.
+rm(type.i)
+
+
+
+#======================================================================================================#
+# >>>>> 8. NUM별 Model Fitting ----
+#======================================================================================================#
+
+graphics.off()
+
+# 670 sec
+result_ls <- list()
+system.time({
+  for ( num.i in 1:60 ){
+    
+    # num.i <- 1
+    
+    # start time
+    start.time <- Sys.time()
+    
+    # num filter
+    train_dt <- train_fn %>% filter(., num==num.i)
+    test_dt  <- test_fn  %>% filter(., num==num.i)
+    
+    # X,y
+    yvar  <- 'used.power'
+    xvars <- c(char.xvars, num.xvars)
+    
+    # sapply(train[,.SD,.SDcols=xvars], class)
+    
+    # unique한 변수들은 제거
+    unique.xvars <- train_dt[, .SD, .SDcols=xvars] %>% 
+      sapply(., function(col){
+        tb <- table(col)
+        length(tb[tb!=0])
+      }) %>%
+      as.data.frame(., row.names = colnames(train_dt[, .SD, .SDcols=xvars])) %>%
+      filter(.==1) %>%
+      rownames()
+    
+    xvars <- setdiff(xvars, unique.xvars)
+    
+    # num / char 구분
+    char.xvar.x <- setdiff(xvars, num.xvars)
+    num.xvar.x  <- setdiff(xvars, char.xvars)
+    
+    #--------------------------------------------------------------------------------------------------#
+    # data type
+    #--------------------------------------------------------------------------------------------------#
+    # one hot encoding
+    tr_num_dt  <- train_dt %>% 
+      select(num.xvar.x)
+    
+    tr_char_dt <- train_dt %>% 
+      select(char.xvar.x) %>%
+      one_hot
+    
+    te_num_dt  <- test_dt %>% 
+      select(num.xvar.x)
+    
+    te_char_dt <- test_dt %>% 
+      select(char.xvar.x) %>%
+      one_hot
+    
+    train_dt2 <- cbind(tr_num_dt,tr_char_dt)
+    test_dt2  <- cbind(te_num_dt,te_char_dt)
+    
+    # lgb type
+    train <- train_dt2 %>% 
+      as.matrix() %>%
+      Matrix(., sparse = T)
+    
+    test  <- test_dt2 %>%
+      as.matrix() %>%
+      Matrix(., sparse = T)
+    
+    #--------------------------------------------------------------------------------------------------#
+    # model fitting
+    #--------------------------------------------------------------------------------------------------#
+    # scaling
+    y_train   <- train_dt$used.power
+    lgb.train <- lgb.Dataset(data = train, label = y_train)
+    
+    # tuning : http://machinelearningkorea.com/2019/09/29/lightgbm-%ED%8C%8C%EB%9D%BC%EB%AF%B8%ED%84%B0/
+    lgb.grid  <- list(objective = "regression",
+                      # min_sum_hessian_in_leaf = 1,
+                      # feature_fraction = 0.7,
+                      # bagging_fraction = 0.7,
+                      # bagging_freq = 5,
+                      # min_data = 100,
+                      # max_bin = 50,
+                      # lambda_l1 = 8,
+                      # lambda_l2 = 1.3,
+                      # min_data_in_bin=100,
+                      # min_gain_to_split = 10,
+                      # min_data_in_leaf = 30,
+                      seed = seed.num)
+    
+    quiet({
+      lgb.fit <- lgb.train(data = lgb.train, learning_rate = 0.02, params = lgb.grid, 
+                           num_leaves = 25, num_threads = 2 , nrounds = 5000,
+                           eval_freq = 20, verbose = 1,
+                           boosting = 'dart') # 추가
+    })
+    
+    train_dt$predict <- predict(lgb.fit,train)
+    test_dt $predict <- predict(lgb.fit,test)
+    # smape_fn(train_dt$predict,train_dt$used.power)
+    
+    
+    #--------------------------------------------------------------------------------------------------#
+    # plotting
+    #--------------------------------------------------------------------------------------------------#    
+    tr.range <- range(c(train_dt$predict, train_dt$used.power))
+    tr.sd    <- sd(c(train_dt$predict, train_dt$used.power))
+    
+    p1 <- train_dt %>% 
+      ggplot(., aes(predict, used.power)) +
+      geom_point() +
+      geom_abline(slope=1, intercept=0, col='red') +
+      labs(title=paste0('Train')) +
+      xlim(tr.range[1]-tr.sd,tr.range[2]+tr.sd) +
+      ylim(tr.range[1]-tr.sd,tr.range[2]+tr.sd) +
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    # end time
+    end.time <- Sys.time()
+    what.x <- paste0('Prev. Fitting Time : ', 
+                     round(round(as.numeric(difftime(end.time, start.time, units = 'sec')),2), 1),
+                     ' Secs')
+    
+    # progress bar function
+    pb_fn(current = num.i, total = 60, width = 80, what = what.x)
+    
+    result_ls[[num.i]] <- list(train       = train_dt,
+                               test        = test_dt,
+                               fit         = lgb.fit,
+                               plot.tr     = p1,
+                               smape       = smape_fn(train_dt$predict, train_dt$used.power),
+                               char.xvar.x = char.xvar.x,
+                               num.xvar.x  = num.xvar.x,
+                               runtime     = as.numeric(difftime(end.time, start.time, units = 'sec')))
+    
+    rm(start.time, train_dt, test_dt, yvar, xvars, unique.xvars, char.xvar.x, num.xvar.x)
+    rm(tr_num_dt, tr_char_dt, te_num_dt, te_char_dt, train_dt2, test_dt2, train, test)
+    rm(scaled, y_train, lgb.train, lgb.grid, lgb.fit)
+    rm(tr.range, tr.sd, p1, end.time, what.x)
+  }
+})
+
+# save the fitting result
+save(train_fn, test_fn, result_ls, file = 'result_ls_lgb_noscaling2.RData')
+# load('result_ls_lgb.RData')
+
+
+
+
+
+#======================================================================================================#
+# >>>>> 9. sample_submission에 맞도록 양식변경 ----
+#======================================================================================================#
+result_dt <- lapply(result_ls, function(x) x$test) %>% rbindlist
+
+
+# num_date_time, answer
+result_dt2 <- data.frame(
+  num_date_time = paste0(result_dt$num,
+                         ' ',
+                         substr(result_dt$time,1,13)),
+  answer = result_dt$predict
+)
+
+# join
+sample_submission <- fread('DAT/sample_submission.csv', header = T, stringsAsFactors = F, sep = ',')
+
+final_submission <- sample_submission %>%
+  subset(., select = num_date_time) %>%
+  left_join(result_dt2, by = c('num_date_time'))
+
+# check the na values
+final_submission[which(is.na(final_submission$answer)),]
+# subset(result_df2, subset = (num==5 & day==25))
+
+# write the result
+write.csv(final_submission, file = 'sample_submission_fn22(2).csv', row.names = F)
+
+
+miss.1 <- read.csv('sample_submission_fn16.csv' ,header=T,stringsAsFactors = F)
+miss.2 <- read.csv('sample_submission_fn22.csv',header=T,stringsAsFactors = F)
+miss.3 <- final_submission
+
+sqrt(sum((miss.1$answer-miss.2$answer)^2))
+sqrt(sum((miss.1$answer-miss.3$answer)^2))
+
+smape_fn(miss.1$answer,miss.2$answer)
+smape_fn(miss.1$answer,miss.3$answer)
+
+
